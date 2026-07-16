@@ -1,3 +1,5 @@
+![thumbnail](./thumbnail.png)
+
 # ccb — Claude Code Bookmark
 
 [English](README.md) | **日本語**
