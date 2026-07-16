@@ -20,7 +20,7 @@ import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 CCB_DIR = Path.home() / ".claude" / "ccb"
 PICK_LIMIT = 20
