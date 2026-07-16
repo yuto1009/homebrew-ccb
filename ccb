@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """ccb - Claude Code Bookmark
 
-Claude Code のセッション履歴からユーザープロンプトを抽出し、
-良かったものをブックマークとして保存・管理する CLI ツール。
+A CLI tool to bookmark your favorite prompts from Claude Code session
+history. Run it in a separate shell session so it never touches your
+running Claude Code context.
 
-- データソース: ~/.claude/projects/<encoded-cwd>/*.jsonl (読み取りのみ)
-- 保存先:       ~/.claude/ccb/<encoded-cwd>.jsonl
-- 依存:         Python 標準ライブラリのみ (curses)
+- Data source: ~/.claude/projects/<encoded-cwd>/*.jsonl (read-only)
+- Bookmarks:   ~/.claude/ccb/<encoded-cwd>.jsonl
+- Dependencies: Python standard library only (curses)
 """
 
 import argparse
@@ -24,7 +25,7 @@ CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
 CCB_DIR = Path.home() / ".claude" / "ccb"
 PICK_LIMIT = 20
 
-# ユーザープロンプトとして扱わないメタメッセージの先頭パターン
+# Messages starting with these prefixes are metadata, not user prompts
 META_PREFIXES = (
     "<command-name>",
     "<command-message>",
@@ -38,11 +39,11 @@ META_PREFIXES = (
 
 
 # ---------------------------------------------------------------------------
-# パス・エンコード
+# Path encoding
 # ---------------------------------------------------------------------------
 
 def encode_cwd(path: str) -> str:
-    """Claude Code の projects ディレクトリ命名規則に合わせて cwd をエンコードする。"""
+    """Encode a cwd the same way Claude Code names its projects directories."""
     return re.sub(r"[^A-Za-z0-9]", "-", path)
 
 
@@ -55,13 +56,14 @@ def bookmark_file_for(cwd: str) -> Path:
 
 
 # ---------------------------------------------------------------------------
-# 履歴からのプロンプト抽出
+# Prompt extraction from session history
 # ---------------------------------------------------------------------------
 
 def _text_from_content(content):
-    """user レコードの message.content からプロンプト本文を取り出す。
+    """Extract prompt text from a user record's message.content.
 
-    ツール結果 (tool_result) を含むものはユーザー入力ではないため除外する。
+    Records containing tool_result items are tool output, not user input,
+    so they are excluded.
     """
     if isinstance(content, str):
         return content
@@ -81,9 +83,9 @@ def _text_from_content(content):
 
 
 def extract_prompts(project_dir: Path):
-    """セッション JSONL 群からユーザープロンプトを (timestamp, text) で収集する。
+    """Collect user prompts as (timestamp, text) from session JSONL files.
 
-    重複除去済み・新しい順で返す。
+    Returns deduplicated entries, newest first.
     """
     entries = []
     for jsonl_path in sorted(project_dir.glob("*.jsonl")):
@@ -112,7 +114,7 @@ def extract_prompts(project_dir: Path):
         except OSError:
             continue
 
-    # ISO 8601 文字列は辞書順ソートで時刻順になる
+    # ISO 8601 strings sort chronologically as plain strings
     entries.sort(key=lambda e: e[0], reverse=True)
 
     seen = set()
@@ -126,11 +128,11 @@ def extract_prompts(project_dir: Path):
 
 
 # ---------------------------------------------------------------------------
-# ブックマークの読み書き
+# Bookmark storage
 # ---------------------------------------------------------------------------
 
 def load_bookmarks(path: Path):
-    """ブックマークファイルを読み、レコードのリストを返す(ファイル順=古い順)。"""
+    """Read the bookmark file and return records in file order (oldest first)."""
     records = []
     if not path.exists():
         return records
@@ -149,7 +151,7 @@ def load_bookmarks(path: Path):
 
 
 def save_bookmarks(cwd: str, texts):
-    """新規テキストのみ追記保存し、保存件数を返す。"""
+    """Append new texts only (skip already-bookmarked ones). Returns count saved."""
     path = bookmark_file_for(cwd)
     existing = {rec["text"] for rec in load_bookmarks(path)}
     new_texts = [t for t in texts if t not in existing]
@@ -165,7 +167,7 @@ def save_bookmarks(cwd: str, texts):
 
 
 def delete_bookmarks(cwd: str, texts_to_delete):
-    """指定テキストのレコードをファイルから完全削除し、削除件数を返す。"""
+    """Remove records matching the given texts. Returns count deleted."""
     path = bookmark_file_for(cwd)
     records = load_bookmarks(path)
     remaining = [r for r in records if r["text"] not in texts_to_delete]
@@ -178,7 +180,7 @@ def delete_bookmarks(cwd: str, texts_to_delete):
 
 
 # ---------------------------------------------------------------------------
-# 表示ユーティリティ (全角対応)
+# Display helpers (East Asian width aware)
 # ---------------------------------------------------------------------------
 
 def display_width(s: str) -> int:
@@ -186,7 +188,7 @@ def display_width(s: str) -> int:
 
 
 def truncate_to_width(s: str, width: int) -> str:
-    """表示幅 width に収まるよう切り詰める。切れた場合は末尾に … を付ける。"""
+    """Truncate to the given display width, appending … when cut."""
     if display_width(s) <= width:
         return s
     result = []
@@ -201,7 +203,7 @@ def truncate_to_width(s: str, width: int) -> str:
 
 
 def wrap_to_width(s: str, width: int):
-    """表示幅 width で折り返した行のリストを返す。"""
+    """Wrap text to the given display width and return the lines."""
     lines = []
     for raw_line in s.split("\n"):
         if not raw_line:
@@ -230,15 +232,15 @@ def one_line(s: str) -> str:
 # TUI
 # ---------------------------------------------------------------------------
 
-def run_selector(items, title, action_label, confirm_message=None):
-    """チェックボックス付きリスト TUI を表示する。
+def run_selector(items, title, action_label, confirm=False):
+    """Show a checkbox-list TUI.
 
-    items: 表示するテキストのリスト
-    title: ヘッダーに出すタイトル
-    action_label: フッターに出す Enter の説明 (例: "保存", "削除")
-    confirm_message: 真の場合、Enter 確定前に y/n 確認を挟む。
+    items: texts to display
+    title: header title
+    action_label: what Enter does (e.g. "save", "delete")
+    confirm: when true, ask y/n before committing on Enter
 
-    戻り値: チェックされたテキストのリスト。キャンセル時は None。
+    Returns the list of checked texts, or None when cancelled.
     """
 
     def _main(stdscr):
@@ -269,7 +271,7 @@ def run_selector(items, title, action_label, confirm_message=None):
                 offset = cursor - list_height + 1
 
             checked_count = sum(checked)
-            header = f" {title}  ({len(items)}件 / チェック {checked_count}件)"
+            header = f" {title}  ({len(items)} items, {checked_count} checked)"
             stdscr.addnstr(0, 0, truncate_to_width(header, width - 1),
                            width - 1, curses.A_BOLD)
 
@@ -289,19 +291,19 @@ def run_selector(items, title, action_label, confirm_message=None):
             for j, pline in enumerate(visible):
                 stdscr.addnstr(sep_y + 1 + j, 1, pline, width - 2)
             if len(preview_lines) > len(visible):
-                more = f"… (他 {len(preview_lines) - len(visible)} 行)"
+                more = f"… ({len(preview_lines) - len(visible)} more lines)"
                 stdscr.addnstr(sep_y + preview_height, 1,
                                truncate_to_width(more, width - 2),
                                width - 2, curses.A_DIM)
 
             footer_y = height - 1
             if confirming:
-                footer = f" {checked_count}件を{action_label}しますか? (y/n)"
+                footer = f" {action_label.capitalize()} {checked_count} item(s)? (y/n)"
                 stdscr.addnstr(footer_y, 0, truncate_to_width(footer, width - 1),
                                width - 1, curses.A_BOLD)
             else:
-                footer = (f" ↑↓/j/k: 移動  Space: チェック  "
-                          f"Enter: {action_label}  q: キャンセル")
+                footer = (f" ↑/↓/j/k: move  Space: toggle  "
+                          f"Enter: {action_label}  q: quit")
                 stdscr.addnstr(footer_y, 0, truncate_to_width(footer, width - 1),
                                width - 1, curses.A_DIM)
 
@@ -324,7 +326,7 @@ def run_selector(items, title, action_label, confirm_message=None):
             elif key in (curses.KEY_ENTER, 10, 13):
                 if sum(checked) == 0:
                     continue
-                if confirm_message:
+                if confirm:
                     confirming = True
                 else:
                     return [items[i] for i in range(len(items)) if checked[i]]
@@ -337,36 +339,36 @@ def run_selector(items, title, action_label, confirm_message=None):
 
 
 # ---------------------------------------------------------------------------
-# サブコマンド
+# Subcommands
 # ---------------------------------------------------------------------------
 
 def cmd_pick(cwd: str) -> int:
     project_dir = project_dir_for(cwd)
     if not project_dir.is_dir():
-        print(f"このディレクトリの Claude Code 履歴が見つかりません: {project_dir}")
+        print(f"No Claude Code history found for this directory: {project_dir}")
         return 1
 
     prompts = extract_prompts(project_dir)
     if not prompts:
-        print("このディレクトリにはユーザープロンプトの履歴がありません。")
+        print("No user prompts found in this directory's history.")
         return 1
 
     items = [text for _, text in prompts[:PICK_LIMIT]]
     selected = run_selector(
         items,
-        title="ccb pick - ブックマークするプロンプトを選択",
-        action_label="保存",
+        title="ccb pick — select prompts to bookmark",
+        action_label="save",
     )
     if selected is None:
-        print("キャンセルしました。")
+        print("Cancelled.")
         return 0
     saved = save_bookmarks(cwd, selected)
     skipped = len(selected) - saved
-    message = f"{saved}件をブックマークに保存しました。"
+    message = f"Saved {saved} bookmark(s)."
     if skipped:
-        message += f" ({skipped}件は保存済みのためスキップ)"
+        message += f" ({skipped} already bookmarked, skipped)"
     print(message)
-    print(f"保存先: {bookmark_file_for(cwd)}")
+    print(f"Bookmark file: {bookmark_file_for(cwd)}")
     return 0
 
 
@@ -374,38 +376,38 @@ def cmd_list(cwd: str) -> int:
     path = bookmark_file_for(cwd)
     records = load_bookmarks(path)
     if not records:
-        print("このディレクトリのブックマークはまだありません。`ccb pick` で保存してください。")
+        print("No bookmarks for this directory yet. Run `ccb pick` first.")
         return 1
 
-    # 新しい順に表示
+    # Newest first
     items = [rec["text"] for rec in reversed(records)]
     selected = run_selector(
         items,
-        title="ccb list - ブックマーク一覧 (チェックした項目を除外)",
-        action_label="削除",
-        confirm_message=True,
+        title="ccb list — bookmarks (checked items will be removed)",
+        action_label="delete",
+        confirm=True,
     )
     if selected is None:
-        print("キャンセルしました。")
+        print("Cancelled.")
         return 0
     deleted = delete_bookmarks(cwd, set(selected))
-    print(f"{deleted}件をブックマークから削除しました。")
+    print(f"Deleted {deleted} bookmark(s).")
     return 0
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
         prog="ccb",
-        description="Claude Code のプロンプトをブックマーク保存する CLI ツール",
+        description="Bookmark your favorite prompts from Claude Code history",
     )
     parser.add_argument("--version", action="version", version=f"ccb {VERSION}")
     subparsers = parser.add_subparsers(dest="command", required=True)
-    subparsers.add_parser("pick", help="履歴からプロンプトを選んでブックマークに保存する")
-    subparsers.add_parser("list", help="ブックマークを一覧表示・削除する")
+    subparsers.add_parser("pick", help="pick prompts from history and bookmark them")
+    subparsers.add_parser("list", help="list bookmarks and remove checked ones")
     args = parser.parse_args()
 
     if not sys.stdout.isatty() or not sys.stdin.isatty():
-        print("ccb は対話的なターミナルで実行してください。", file=sys.stderr)
+        print("ccb requires an interactive terminal.", file=sys.stderr)
         return 1
 
     cwd = os.getcwd()

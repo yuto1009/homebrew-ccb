@@ -1,13 +1,38 @@
 # ccb — Claude Code Bookmark
 
-Claude Code（CLI）で打ったプロンプトのうち「良かったもの」をブックマーク保存する CLI ツールです。
-Claude 起動中とは別のシェルセッションで動かすため、コンテキストを一切汚しません。
+**English** | [日本語](README.ja.md)
 
-- Claude Code のセッション履歴（`~/.claude/projects/`）を **読み取り専用** で参照します（本体には何も書き込みません）
-- ブックマークは `~/.claude/ccb/` 配下に **cwd 別の JSONL** で保存され、後から grep 等で扱えます
-- 依存は Python 標準ライブラリのみ（`curses`）。追加パッケージ不要です
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Platform](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)]()
+[![Dependencies](https://img.shields.io/badge/dependencies-none-brightgreen.svg)]()
 
-## インストール
+Bookmark the prompts that worked.
+
+`ccb` digs through your [Claude Code](https://claude.com/claude-code) session history, shows you the prompts you've written in the current project, and lets you save the good ones — so your best prompts stop disappearing into log files.
+
+```
+ ccb pick — select prompts to bookmark  (20 items, 2 checked)
+ [x] Fix the flaky auth test and explain the root cause of the failure
+ [ ] Refactor the session parser to stream large JSONL files
+ [x] Write a migration script that backfills the new status column
+ [ ] Add error handling to the webhook endpoint and retry on 5xx
+─────────────────────────────────────────────────────────────────────
+ Fix the flaky auth test and explain the root cause of the failure
+
+ ↑/↓/j/k: move  Space: toggle  Enter: save  q: quit
+```
+
+## Why
+
+A great prompt is a reusable asset — but once a Claude Code session ends, it's buried in JSONL files you'll never open. `ccb` runs in a separate shell session, reads that history **without touching your running Claude Code context**, and turns your best prompts into a curated, greppable collection.
+
+- **Zero dependencies** — a single Python file using only the standard library
+- **Read-only & safe** — never writes to Claude Code's data; it only reads session history
+- **Per-project** — reads and stores bookmarks scoped to the directory you run it in
+- **Plain JSONL storage** — bookmarks live in `~/.claude/ccb/`, ready for `grep`, `jq`, or `fzf`
+- **CJK-aware TUI** — East Asian wide characters are measured and wrapped correctly
+
+## Installation
 
 ### Homebrew
 
@@ -16,81 +41,72 @@ brew tap yuto1009/ccb
 brew install ccb
 ```
 
-> 初回リリース（タグ）前に試す場合は `brew install --HEAD ccb` を使ってください。
-
-### 手動インストール
+### Manual
 
 ```sh
 git clone https://github.com/yuto1009/homebrew-ccb.git
 ln -s "$(pwd)/homebrew-ccb/ccb" /usr/local/bin/ccb
 ```
 
-macOS 標準の `python3` で動作します。
+Requires Python 3.8+ (the `python3` preinstalled on macOS works).
 
-## 使い方
+## Usage
 
-Claude Code を使っているプロジェクトのディレクトリで実行します。
+Run it inside a project where you use Claude Code.
 
-### `ccb pick` — 履歴からプロンプトを選んで保存
+### `ccb pick` — bookmark prompts from history
 
-そのディレクトリの Claude Code 履歴から抽出したユーザープロンプト
-（重複除去後の直近 20 件）を一覧表示し、選んだものをブックマークに保存します。
+Shows the 20 most recent unique user prompts from this directory's Claude Code history. Check the ones you want and press Enter to save.
 
 ```sh
 cd ~/your-project
 ccb pick
 ```
 
-### `ccb list` — ブックマークの一覧・削除
+### `ccb list` — browse and remove bookmarks
 
-そのディレクトリで保存したブックマークを新しい順に一覧表示します。
-チェックした項目を Enter で確定すると、確認（y/n）のうえブックマークから完全削除します。
+Shows this directory's bookmarks, newest first. Check items and press Enter to remove them (with a y/n confirmation).
 
 ```sh
 ccb list
 ```
 
-### キー操作（共通）
+### Key bindings
 
-| キー | 動作 |
+| Key | Action |
 | --- | --- |
-| `↑` `↓` / `k` `j` | カーソル移動 |
-| `Space` | チェックの切り替え |
-| `Enter` | 確定（pick: 保存 / list: 削除。削除時は y/n 確認あり） |
-| `q` / `Esc` | 何もせず終了 |
+| `↑` `↓` / `k` `j` | Move cursor |
+| `Space` | Toggle check |
+| `Enter` | Confirm (pick: save / list: delete, with y/n confirmation) |
+| `q` / `Esc` | Quit without changes |
 
-画面下部にはカーソル位置のプロンプト全文のプレビューが表示されます。
+The bottom pane always previews the full text of the highlighted prompt.
 
-## データの場所
+## How it works
 
-| 用途 | パス |
+| Purpose | Path |
 | --- | --- |
-| 読み取り元（Claude Code 履歴） | `~/.claude/projects/<encoded-cwd>/*.jsonl` |
-| ブックマーク保存先 | `~/.claude/ccb/<encoded-cwd>.jsonl` |
+| Reads (Claude Code history) | `~/.claude/projects/<encoded-cwd>/*.jsonl` |
+| Writes (your bookmarks) | `~/.claude/ccb/<encoded-cwd>.jsonl` |
 
-`<encoded-cwd>` は Claude Code の命名規則（英数字以外を `-` に置換）に合わせています。
-ブックマークは 1 行 1 レコードの JSONL です:
+`<encoded-cwd>` follows Claude Code's own naming convention (non-alphanumeric characters replaced with `-`), so `ccb` always operates on the history of the directory you run it from.
+
+Bookmarks are one JSON record per line:
 
 ```json
-{"text": "プロンプト本文", "bookmarked_at": "2026-07-16T12:00:00+09:00", "cwd": "/Users/you/your-project"}
+{"text": "the prompt text", "bookmarked_at": "2026-07-16T12:00:00+09:00", "cwd": "/Users/you/your-project"}
 ```
 
-## 抽出ルール
+Extraction rules:
 
-- ユーザープロンプトのみを対象（ツール実行結果、システムメタ、slash コマンドのメタ、割り込みメッセージ等は除外）
-- 同一テキストは 1 件に集約し、新しい順に並べる
-- 既にブックマーク済みのプロンプトは重複保存しない
+- Only real user prompts — tool results, system metadata, slash-command internals, and interruption markers are filtered out
+- Duplicate texts are collapsed into one entry, newest first
+- Already-bookmarked prompts are never saved twice
 
-## リリース手順（メンテナ向け）
+## Contributing
 
-1. `ccb` 内の `VERSION` を更新してコミット
-2. タグを打って push: `git tag v0.1.0 && git push origin main --tags`
-3. tarball の sha256 を計算:
-   ```sh
-   curl -sL https://github.com/yuto1009/homebrew-ccb/archive/refs/tags/v0.1.0.tar.gz | shasum -a 256
-   ```
-4. `Formula/ccb.rb` の `url`（バージョン）と `sha256` を更新してコミット・push
+Issues and pull requests are welcome!
 
-## ライセンス
+## License
 
 [MIT](LICENSE)
