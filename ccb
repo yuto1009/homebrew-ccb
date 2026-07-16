@@ -1,0 +1,420 @@
+#!/usr/bin/env python3
+"""ccb - Claude Code Bookmark
+
+Claude Code のセッション履歴からユーザープロンプトを抽出し、
+良かったものをブックマークとして保存・管理する CLI ツール。
+
+- データソース: ~/.claude/projects/<encoded-cwd>/*.jsonl (読み取りのみ)
+- 保存先:       ~/.claude/ccb/<encoded-cwd>.jsonl
+- 依存:         Python 標準ライブラリのみ (curses)
+"""
+
+import argparse
+import curses
+import json
+import os
+import re
+import sys
+import unicodedata
+from datetime import datetime, timezone
+from pathlib import Path
+
+VERSION = "0.1.0"
+CLAUDE_PROJECTS_DIR = Path.home() / ".claude" / "projects"
+CCB_DIR = Path.home() / ".claude" / "ccb"
+PICK_LIMIT = 20
+
+# ユーザープロンプトとして扱わないメタメッセージの先頭パターン
+META_PREFIXES = (
+    "<command-name>",
+    "<command-message>",
+    "<local-command-stdout>",
+    "<local-command-caveat>",
+    "<system-reminder>",
+    "<task-notification>",
+    "Caveat: The messages below",
+    "[Request interrupted",
+)
+
+
+# ---------------------------------------------------------------------------
+# パス・エンコード
+# ---------------------------------------------------------------------------
+
+def encode_cwd(path: str) -> str:
+    """Claude Code の projects ディレクトリ命名規則に合わせて cwd をエンコードする。"""
+    return re.sub(r"[^A-Za-z0-9]", "-", path)
+
+
+def project_dir_for(cwd: str) -> Path:
+    return CLAUDE_PROJECTS_DIR / encode_cwd(cwd)
+
+
+def bookmark_file_for(cwd: str) -> Path:
+    return CCB_DIR / (encode_cwd(cwd) + ".jsonl")
+
+
+# ---------------------------------------------------------------------------
+# 履歴からのプロンプト抽出
+# ---------------------------------------------------------------------------
+
+def _text_from_content(content):
+    """user レコードの message.content からプロンプト本文を取り出す。
+
+    ツール結果 (tool_result) を含むものはユーザー入力ではないため除外する。
+    """
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for item in content:
+            if not isinstance(item, dict):
+                continue
+            if item.get("type") == "tool_result":
+                return None
+            if item.get("type") == "text":
+                text = item.get("text") or ""
+                if not text.lstrip().startswith(META_PREFIXES):
+                    parts.append(text)
+        return "\n".join(parts)
+    return None
+
+
+def extract_prompts(project_dir: Path):
+    """セッション JSONL 群からユーザープロンプトを (timestamp, text) で収集する。
+
+    重複除去済み・新しい順で返す。
+    """
+    entries = []
+    for jsonl_path in sorted(project_dir.glob("*.jsonl")):
+        try:
+            with jsonl_path.open(encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if rec.get("type") != "user":
+                        continue
+                    if rec.get("isSidechain") or rec.get("isMeta"):
+                        continue
+                    message = rec.get("message") or {}
+                    text = _text_from_content(message.get("content"))
+                    if not text:
+                        continue
+                    text = text.strip()
+                    if not text or text.startswith(META_PREFIXES):
+                        continue
+                    entries.append((rec.get("timestamp") or "", text))
+        except OSError:
+            continue
+
+    # ISO 8601 文字列は辞書順ソートで時刻順になる
+    entries.sort(key=lambda e: e[0], reverse=True)
+
+    seen = set()
+    result = []
+    for ts, text in entries:
+        if text in seen:
+            continue
+        seen.add(text)
+        result.append((ts, text))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# ブックマークの読み書き
+# ---------------------------------------------------------------------------
+
+def load_bookmarks(path: Path):
+    """ブックマークファイルを読み、レコードのリストを返す(ファイル順=古い順)。"""
+    records = []
+    if not path.exists():
+        return records
+    with path.open(encoding="utf-8", errors="replace") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(rec, dict) and rec.get("text"):
+                records.append(rec)
+    return records
+
+
+def save_bookmarks(cwd: str, texts):
+    """新規テキストのみ追記保存し、保存件数を返す。"""
+    path = bookmark_file_for(cwd)
+    existing = {rec["text"] for rec in load_bookmarks(path)}
+    new_texts = [t for t in texts if t not in existing]
+    if not new_texts:
+        return 0
+    CCB_DIR.mkdir(parents=True, exist_ok=True)
+    now = datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+    with path.open("a", encoding="utf-8") as f:
+        for text in new_texts:
+            rec = {"text": text, "bookmarked_at": now, "cwd": cwd}
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    return len(new_texts)
+
+
+def delete_bookmarks(cwd: str, texts_to_delete):
+    """指定テキストのレコードをファイルから完全削除し、削除件数を返す。"""
+    path = bookmark_file_for(cwd)
+    records = load_bookmarks(path)
+    remaining = [r for r in records if r["text"] not in texts_to_delete]
+    deleted = len(records) - len(remaining)
+    if deleted:
+        with path.open("w", encoding="utf-8") as f:
+            for rec in remaining:
+                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    return deleted
+
+
+# ---------------------------------------------------------------------------
+# 表示ユーティリティ (全角対応)
+# ---------------------------------------------------------------------------
+
+def display_width(s: str) -> int:
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in s)
+
+
+def truncate_to_width(s: str, width: int) -> str:
+    """表示幅 width に収まるよう切り詰める。切れた場合は末尾に … を付ける。"""
+    if display_width(s) <= width:
+        return s
+    result = []
+    used = 0
+    for c in s:
+        w = 2 if unicodedata.east_asian_width(c) in "WF" else 1
+        if used + w > width - 1:
+            break
+        result.append(c)
+        used += w
+    return "".join(result) + "…"
+
+
+def wrap_to_width(s: str, width: int):
+    """表示幅 width で折り返した行のリストを返す。"""
+    lines = []
+    for raw_line in s.split("\n"):
+        if not raw_line:
+            lines.append("")
+            continue
+        current = []
+        used = 0
+        for c in raw_line:
+            w = 2 if unicodedata.east_asian_width(c) in "WF" else 1
+            if used + w > width:
+                lines.append("".join(current))
+                current = [c]
+                used = w
+            else:
+                current.append(c)
+                used += w
+        lines.append("".join(current))
+    return lines
+
+
+def one_line(s: str) -> str:
+    return re.sub(r"\s+", " ", s).strip()
+
+
+# ---------------------------------------------------------------------------
+# TUI
+# ---------------------------------------------------------------------------
+
+def run_selector(items, title, action_label, confirm_message=None):
+    """チェックボックス付きリスト TUI を表示する。
+
+    items: 表示するテキストのリスト
+    title: ヘッダーに出すタイトル
+    action_label: フッターに出す Enter の説明 (例: "保存", "削除")
+    confirm_message: 真の場合、Enter 確定前に y/n 確認を挟む。
+
+    戻り値: チェックされたテキストのリスト。キャンセル時は None。
+    """
+
+    def _main(stdscr):
+        curses.curs_set(0)
+        stdscr.keypad(True)
+        cursor = 0
+        offset = 0
+        checked = [False] * len(items)
+        confirming = False
+
+        while True:
+            stdscr.erase()
+            height, width = stdscr.getmaxyx()
+
+            preview_height = max(3, height // 3)
+            list_height = height - preview_height - 4  # header + separator + footer
+            if list_height < 1:
+                stdscr.addstr(0, 0, "Terminal too small")
+                stdscr.refresh()
+                key = stdscr.getch()
+                if key in (ord("q"), 27):
+                    return None
+                continue
+
+            if cursor < offset:
+                offset = cursor
+            elif cursor >= offset + list_height:
+                offset = cursor - list_height + 1
+
+            checked_count = sum(checked)
+            header = f" {title}  ({len(items)}件 / チェック {checked_count}件)"
+            stdscr.addnstr(0, 0, truncate_to_width(header, width - 1),
+                           width - 1, curses.A_BOLD)
+
+            for i in range(offset, min(offset + list_height, len(items))):
+                y = 1 + (i - offset)
+                mark = "[x]" if checked[i] else "[ ]"
+                line = f" {mark} {one_line(items[i])}"
+                attr = curses.A_REVERSE if i == cursor else curses.A_NORMAL
+                stdscr.addnstr(y, 0, truncate_to_width(line, width - 1),
+                               width - 1, attr)
+
+            sep_y = 1 + list_height
+            stdscr.hline(sep_y, 0, curses.ACS_HLINE, width)
+
+            preview_lines = wrap_to_width(items[cursor], width - 2)
+            visible = preview_lines[: preview_height - 1]
+            for j, pline in enumerate(visible):
+                stdscr.addnstr(sep_y + 1 + j, 1, pline, width - 2)
+            if len(preview_lines) > len(visible):
+                more = f"… (他 {len(preview_lines) - len(visible)} 行)"
+                stdscr.addnstr(sep_y + preview_height, 1,
+                               truncate_to_width(more, width - 2),
+                               width - 2, curses.A_DIM)
+
+            footer_y = height - 1
+            if confirming:
+                footer = f" {checked_count}件を{action_label}しますか? (y/n)"
+                stdscr.addnstr(footer_y, 0, truncate_to_width(footer, width - 1),
+                               width - 1, curses.A_BOLD)
+            else:
+                footer = (f" ↑↓/j/k: 移動  Space: チェック  "
+                          f"Enter: {action_label}  q: キャンセル")
+                stdscr.addnstr(footer_y, 0, truncate_to_width(footer, width - 1),
+                               width - 1, curses.A_DIM)
+
+            stdscr.refresh()
+            key = stdscr.getch()
+
+            if confirming:
+                if key in (ord("y"), ord("Y")):
+                    return [items[i] for i in range(len(items)) if checked[i]]
+                if key in (ord("n"), ord("N"), 27, ord("q")):
+                    confirming = False
+                continue
+
+            if key in (curses.KEY_UP, ord("k")):
+                cursor = max(0, cursor - 1)
+            elif key in (curses.KEY_DOWN, ord("j")):
+                cursor = min(len(items) - 1, cursor + 1)
+            elif key == ord(" "):
+                checked[cursor] = not checked[cursor]
+            elif key in (curses.KEY_ENTER, 10, 13):
+                if sum(checked) == 0:
+                    continue
+                if confirm_message:
+                    confirming = True
+                else:
+                    return [items[i] for i in range(len(items)) if checked[i]]
+            elif key in (ord("q"), 27):
+                return None
+            elif key == curses.KEY_RESIZE:
+                offset = 0
+
+    return curses.wrapper(_main)
+
+
+# ---------------------------------------------------------------------------
+# サブコマンド
+# ---------------------------------------------------------------------------
+
+def cmd_pick(cwd: str) -> int:
+    project_dir = project_dir_for(cwd)
+    if not project_dir.is_dir():
+        print(f"このディレクトリの Claude Code 履歴が見つかりません: {project_dir}")
+        return 1
+
+    prompts = extract_prompts(project_dir)
+    if not prompts:
+        print("このディレクトリにはユーザープロンプトの履歴がありません。")
+        return 1
+
+    items = [text for _, text in prompts[:PICK_LIMIT]]
+    selected = run_selector(
+        items,
+        title="ccb pick - ブックマークするプロンプトを選択",
+        action_label="保存",
+    )
+    if selected is None:
+        print("キャンセルしました。")
+        return 0
+    saved = save_bookmarks(cwd, selected)
+    skipped = len(selected) - saved
+    message = f"{saved}件をブックマークに保存しました。"
+    if skipped:
+        message += f" ({skipped}件は保存済みのためスキップ)"
+    print(message)
+    print(f"保存先: {bookmark_file_for(cwd)}")
+    return 0
+
+
+def cmd_list(cwd: str) -> int:
+    path = bookmark_file_for(cwd)
+    records = load_bookmarks(path)
+    if not records:
+        print("このディレクトリのブックマークはまだありません。`ccb pick` で保存してください。")
+        return 1
+
+    # 新しい順に表示
+    items = [rec["text"] for rec in reversed(records)]
+    selected = run_selector(
+        items,
+        title="ccb list - ブックマーク一覧 (チェックした項目を除外)",
+        action_label="削除",
+        confirm_message=True,
+    )
+    if selected is None:
+        print("キャンセルしました。")
+        return 0
+    deleted = delete_bookmarks(cwd, set(selected))
+    print(f"{deleted}件をブックマークから削除しました。")
+    return 0
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        prog="ccb",
+        description="Claude Code のプロンプトをブックマーク保存する CLI ツール",
+    )
+    parser.add_argument("--version", action="version", version=f"ccb {VERSION}")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    subparsers.add_parser("pick", help="履歴からプロンプトを選んでブックマークに保存する")
+    subparsers.add_parser("list", help="ブックマークを一覧表示・削除する")
+    args = parser.parse_args()
+
+    if not sys.stdout.isatty() or not sys.stdin.isatty():
+        print("ccb は対話的なターミナルで実行してください。", file=sys.stderr)
+        return 1
+
+    cwd = os.getcwd()
+    if args.command == "pick":
+        return cmd_pick(cwd)
+    if args.command == "list":
+        return cmd_list(cwd)
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
