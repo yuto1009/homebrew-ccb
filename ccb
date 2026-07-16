@@ -232,6 +232,49 @@ def one_line(s: str) -> str:
 # TUI
 # ---------------------------------------------------------------------------
 
+def init_style():
+    """Build the attribute set for the TUI.
+
+    Uses the Claude Code orange as the accent color, degrading gracefully:
+    256-color terminals get the closest xterm color, 8-color terminals fall
+    back to yellow, and monochrome terminals get bold/dim attributes only.
+    """
+    style = {
+        "accent": curses.A_BOLD,
+        "title": curses.A_BOLD,
+        "dim": curses.A_DIM,
+        "cursor": curses.A_REVERSE,
+        "normal": curses.A_NORMAL,
+    }
+    if not curses.has_colors():
+        return style
+    try:
+        curses.start_color()
+        curses.use_default_colors()
+        # xterm 173 (#d7875f) is the closest match to Claude Code's #d97757
+        accent = 173 if curses.COLORS >= 256 else curses.COLOR_YELLOW
+        gray = 245 if curses.COLORS >= 256 else -1
+        curses.init_pair(1, accent, -1)
+        curses.init_pair(2, gray, -1)
+    except curses.error:
+        return style
+    style["accent"] = curses.color_pair(1) | curses.A_BOLD
+    style["title"] = curses.color_pair(1) | curses.A_BOLD
+    style["dim"] = curses.color_pair(2)
+    style["cursor"] = curses.color_pair(1) | curses.A_BOLD
+    return style
+
+
+def draw_segments(stdscr, y, x, width, segments):
+    """Draw (text, attr) segments on one row, clipping at the right edge."""
+    for text, attr in segments:
+        if x >= width - 1:
+            break
+        stdscr.addnstr(y, x, truncate_to_width(text, width - 1 - x),
+                       width - 1 - x, attr)
+        x += display_width(text)
+
+
 def run_selector(items, title, action_label, confirm=False):
     """Show a checkbox-list TUI.
 
@@ -246,6 +289,9 @@ def run_selector(items, title, action_label, confirm=False):
     def _main(stdscr):
         curses.curs_set(0)
         stdscr.keypad(True)
+        style = init_style()
+        # "ccb pick — description" → command part gets the accent color
+        cmd_part, _, desc_part = title.partition(" — ")
         cursor = 0
         offset = 0
         checked = [False] * len(items)
@@ -271,20 +317,34 @@ def run_selector(items, title, action_label, confirm=False):
                 offset = cursor - list_height + 1
 
             checked_count = sum(checked)
-            header = f" {title}  ({len(items)} items, {checked_count} checked)"
-            stdscr.addnstr(0, 0, truncate_to_width(header, width - 1),
-                           width - 1, curses.A_BOLD)
+            header_segs = [(" $ ", style["dim"]), (cmd_part, style["title"])]
+            if desc_part:
+                header_segs.append((f"  # {desc_part}", style["dim"]))
+            header_segs.append(
+                (f"  ({len(items)} items, {checked_count} checked)",
+                 style["dim"]))
+            draw_segments(stdscr, 0, 0, width, header_segs)
 
             for i in range(offset, min(offset + list_height, len(items))):
                 y = 1 + (i - offset)
+                is_cursor = i == cursor
+                pointer = "❯ " if is_cursor else "  "
                 mark = "[x]" if checked[i] else "[ ]"
-                line = f" {mark} {one_line(items[i])}"
-                attr = curses.A_REVERSE if i == cursor else curses.A_NORMAL
-                stdscr.addnstr(y, 0, truncate_to_width(line, width - 1),
-                               width - 1, attr)
+                mark_attr = style["accent"] if checked[i] else style["dim"]
+                text_attr = style["cursor"] if is_cursor else style["normal"]
+                text = truncate_to_width(one_line(items[i]), width - 10)
+                draw_segments(stdscr, y, 0, width, [
+                    (pointer, style["cursor"] if is_cursor else style["normal"]),
+                    (mark, mark_attr),
+                    (" " + text, text_attr),
+                ])
+                if checked[i] and width > 12:
+                    stdscr.addnstr(y, width - 3, "★", 2, style["accent"])
 
             sep_y = 1 + list_height
-            stdscr.hline(sep_y, 0, curses.ACS_HLINE, width)
+            stdscr.hline(sep_y, 0, curses.ACS_HLINE | style["dim"], width)
+            if width > 12:
+                stdscr.addnstr(sep_y, 1, " PREVIEW ", width - 2, style["dim"])
 
             preview_lines = wrap_to_width(items[cursor], width - 2)
             visible = preview_lines[: preview_height - 1]
@@ -294,18 +354,23 @@ def run_selector(items, title, action_label, confirm=False):
                 more = f"… ({len(preview_lines) - len(visible)} more lines)"
                 stdscr.addnstr(sep_y + preview_height, 1,
                                truncate_to_width(more, width - 2),
-                               width - 2, curses.A_DIM)
+                               width - 2, style["dim"])
 
             footer_y = height - 1
             if confirming:
-                footer = f" {action_label.capitalize()} {checked_count} item(s)? (y/n)"
-                stdscr.addnstr(footer_y, 0, truncate_to_width(footer, width - 1),
-                               width - 1, curses.A_BOLD)
+                draw_segments(stdscr, footer_y, 0, width, [
+                    (f" {action_label.capitalize()} {checked_count} item(s)? ",
+                     curses.A_BOLD),
+                    ("(y/n)", style["accent"]),
+                ])
             else:
-                footer = (f" ↑/↓/j/k: move  Space: toggle  "
-                          f"Enter: {action_label}  q: quit")
-                stdscr.addnstr(footer_y, 0, truncate_to_width(footer, width - 1),
-                               width - 1, curses.A_DIM)
+                draw_segments(stdscr, footer_y, 0, width, [
+                    (" ↑/↓ j/k", style["accent"]), (" move  ", style["dim"]),
+                    ("Space", style["accent"]), (" toggle  ", style["dim"]),
+                    ("Enter", style["accent"]),
+                    (f" {action_label}  ", style["dim"]),
+                    ("q", style["accent"]), (" quit", style["dim"]),
+                ])
 
             stdscr.refresh()
             key = stdscr.getch()
